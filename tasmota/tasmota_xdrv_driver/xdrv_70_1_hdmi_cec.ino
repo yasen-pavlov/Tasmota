@@ -48,7 +48,7 @@ void HDMI_OnReceive(class CEC_Device *self, int32_t from, int32_t to, uint8_t* b
   }
 
   Response_P(PSTR("{\"HdmiReceived\":{\"From\":%i,\"To\":%i,\"Data\":\"%*_H\"}}"), from, to, len, buf);
-  if (to == self->getLogicalAddress() || to == 0x0F) {
+  if (to == self->getLogicalAddress() || to == 0x0F || (HDMI_CEC_PUBLISH_AUDIO_SYSTEM && to == 0x05)) {
     MqttPublishPrefixTopic_P(TELE, PSTR(D_RSLT_SENSOR), Settings->flag.mqtt_sensor_retain);
   }
   XdrvRulesProcess(0);     // apply rules
@@ -68,11 +68,11 @@ CEC_Device *HDMI_CEC_device = nullptr;
 void HdmiCecInit(void)
 {
   // CEC device type
-  CEC_Device::CEC_DEVICE_TYPE device_type = (CEC_Device::CEC_DEVICE_TYPE) Settings->hdmi_cec_device_type;
+  CEC_Device::CEC_DEVICE_TYPE device_type = (CEC_Device::CEC_DEVICE_TYPE) (Settings->hdmi_cec_device_type & HDMI_CEC_TYPE_MASK);
   if (device_type < 0 || device_type >= CEC_Device::CDT_LAST) {
     // if type in Settings is invalid, default to PLAYBACK_DEVICE
     device_type = CEC_Device::CDT_PLAYBACK_DEVICE;
-    Settings->hdmi_cec_device_type = (uint8_t) device_type;
+    Settings->hdmi_cec_device_type = (Settings->hdmi_cec_device_type & HDMI_CEC_FORCE_PHYSICAL_ADDRESS) | (uint8_t) device_type;
     SettingsSaveAll();
   }
   // GPIO configuration
@@ -103,6 +103,11 @@ void IRAM_ATTR CEC_Run(void *self) {
  * Commands
 \*********************************************************************************************/
 
+
+void HDMIRespondTransmit(void) {
+  bool ack = HDMI_CEC_device->waitForTransmit();
+  Response_P(PSTR("{\"%s\":{\"Ack\":%s}}"), XdrvMailbox.command, ack ? PSTR("true") : PSTR("false"));
+}
 //
 // Command HdmiSendRaw
 //
@@ -116,15 +121,7 @@ void CmndHDMISendRaw(void) {
     if (buf.len() > 0 && buf.len() < 16) {
       bool success = HDMI_CEC_device->transmitRaw(buf.buf(), buf.len());
       if (success) {
-        bool transmitting = true;
-        while (transmitting) {
-          HDMI_CEC_device->run();
-          transmitting = HDMI_CEC_device->isTransmitting();
-          if (transmitting) {
-            delay(1);  // wait until next ms
-          }
-        }
-        ResponseCmndDone();
+        HDMIRespondTransmit();
       } else {
         ResponseCmndChar_P(PSTR("Sending failed"));
       }
@@ -171,15 +168,7 @@ void CmndHDMISend(void) {
       if (buf.len() > 0 && buf.len() < 15) {
         bool success = HDMI_CEC_device->transmitFrame(to, buf.buf(), buf.len());
         if (success) {
-          bool transmitting = true;
-          while (transmitting) {
-            HDMI_CEC_device->run();
-            transmitting = HDMI_CEC_device->isTransmitting();
-            if (transmitting) {
-              delay(1);  // wait until next ms
-            }
-          }
-          ResponseCmndDone();
+          HDMIRespondTransmit();
         } else {
           ResponseCmndChar_P(PSTR("Sending failed"));
         }
@@ -196,8 +185,7 @@ void CmndHDMISend(void) {
       if (buf.len() > 0 && buf.len() < 15) {
         bool success = HDMI_CEC_device->transmitFrame(0, buf.buf(), buf.len());
         if (success) {
-          HDMI_CEC_device->run();
-          ResponseCmndDone();
+          HDMIRespondTransmit();
         } else {
           ResponseCmndChar_P(PSTR("Sending failed"));
         }
@@ -220,13 +208,13 @@ void CmndHDMIType(void) {
   if (XdrvMailbox.data_len > 0) {
     if ((XdrvMailbox.payload >= 0) && (XdrvMailbox.payload < CEC_Device::CDT_LAST)) {
       uint8_t type = XdrvMailbox.payload;
-      if (type != Settings->hdmi_cec_device_type) {
-        Settings->hdmi_cec_device_type = XdrvMailbox.payload;
+      if (type != (Settings->hdmi_cec_device_type & HDMI_CEC_TYPE_MASK)) {
+        Settings->hdmi_cec_device_type = (Settings->hdmi_cec_device_type & HDMI_CEC_FORCE_PHYSICAL_ADDRESS) | type;
         SettingsSaveAll();
       }
     }
   }
-  ResponseCmndNumber(Settings->hdmi_cec_device_type);
+  ResponseCmndNumber(Settings->hdmi_cec_device_type & HDMI_CEC_TYPE_MASK);
 }
 
 #define HDMI_EDID_ADDRESS      0x50    // HDMI EDID address is 0x50
@@ -317,16 +305,23 @@ uint16_t HDMIGetPhysicalAddress(void) {
 }
 
 
+// HdmiAddr 0x0000 stores and forces the physical address, including TV root 0.
+// Decimal input remains supported. HdmiAddr -1 returns to EDID discovery.
+// Changes take effect after Restart 1; a query reports the running address.
 void CmndHDMIAddr(void) {
   if (XdrvMailbox.data_len > 0) {
-    if ((XdrvMailbox.payload > 0)) {
+    if (XdrvMailbox.payload == -1) {
+      Settings->hdmi_cec_device_type &= ~HDMI_CEC_FORCE_PHYSICAL_ADDRESS;
+      SettingsSaveAll();
+    } else if (XdrvMailbox.payload >= 0 && XdrvMailbox.payload <= 0xFFFF) {
       uint16_t hdmi_addr = XdrvMailbox.payload;
-      Settings->hdmi_addr[0] = (hdmi_addr) & 0xFF;
+      Settings->hdmi_addr[0] = hdmi_addr & 0xFF;
       Settings->hdmi_addr[1] = (hdmi_addr >> 8) & 0xFF;
+      Settings->hdmi_cec_device_type |= HDMI_CEC_FORCE_PHYSICAL_ADDRESS;
+      SettingsSaveAll();
     }
   }
-  uint16_t hdmi_addr = HDMI_CEC_device->discoverPhysicalAddress();
-  Response_P(PSTR("{\"%s\":\"0x%04X\"}"), XdrvMailbox.command, hdmi_addr);
+  Response_P(PSTR("{\"%s\":\"0x%04X\"}"), XdrvMailbox.command, HDMI_CEC_device->getPhysicalAddress());
 }
 
 /*********************************************************************************************\

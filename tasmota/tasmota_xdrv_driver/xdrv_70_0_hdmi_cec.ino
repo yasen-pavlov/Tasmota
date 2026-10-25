@@ -23,6 +23,13 @@
  * Macros used for debug mode
 \*********************************************************************************************/
 
+// The low seven bits retain the device type; bit 7 forces the stored address.
+#define HDMI_CEC_TYPE_MASK              0x7F
+#define HDMI_CEC_FORCE_PHYSICAL_ADDRESS 0x80
+#ifndef HDMI_CEC_PUBLISH_AUDIO_SYSTEM
+#define HDMI_CEC_PUBLISH_AUDIO_SYSTEM   1
+#endif
+
 #define HDMI_DEBUG      // remove once stabilized
 
 #ifdef HDMI_DEBUG
@@ -248,6 +255,7 @@ public:
   CEC_Device(int gpio, CEC_DEVICE_TYPE type, bool promiscuous = false, bool monitor_mode = false);
   void run();   // this must be called at each millisecond tick
   bool IRAM_ATTR isTransmitting() const { return _transmit_buffer_bytes != 0; }
+  bool waitForTransmit();    // command path: complete Tx before processing queued Rx
   void checkMessages();      // check regularly for mailbox
   // signal to Tasmota to exit the normal sleep and trigger a new tick event in the next millisecond
   void enableISR(void);
@@ -404,6 +412,7 @@ protected:
 
   bool _eom;      // end of message
   bool _ack;
+  bool _transmit_ack = false;
   bool _follower;
   bool _broadcast;
   bool _am_last_transmittor;
@@ -501,11 +510,9 @@ void CEC_Device::runTransmit() {
   uint32_t now = micros();
   if (!now) { now = 1; }    // avoid now == 0 which has a special meaning
   bool electrical_line_state = lineState();
+  const uint32_t transmit_bytes = _transmit_buffer_bytes;
+  bool transmit_ack = false;
 
-  if (_xmitretry > CEC_MAX_RETRANSMIT) {    // if exhausted retries, abort
-    _transmit_buffer_bytes = 0;
-    _state = CEC_IDLE;
-  }
   _state = CEC_XMIT_WAIT;     // start with XMIT_WAIT
   _bit_start_time = now;
 
@@ -636,8 +643,6 @@ void CEC_Device::runTransmit() {
 
           if (electrical_line_state == 1) {
             // No ACK
-            _ring_buffer.push(_transmit_buffer, _transmit_buffer_bytes, CEC_RingBuffer::MSG_TRANSMITTED, false);
-            // OnTransmitComplete(_transmit_buffer, _transmitBufferBitIdx >> 3, false);
 
             // Normally we retransmit.  But this is NOT the case for <Polling Message> as its
             // function is basically to 'ping' a logical address in which case we just want
@@ -652,8 +657,7 @@ void CEC_Device::runTransmit() {
               // Nothing left to transmit, go back to idle
               _transmit_buffer_bytes = 0;
               _state = CEC_IDLE;
-              _ring_buffer.push(_transmit_buffer, _transmitBufferBitIdx >> 3, CEC_RingBuffer::MSG_TRANSMITTED, true);
-              // OnTransmitComplete(_transmit_buffer, _transmitBufferBitIdx >> 3, true);
+              transmit_ack = true;
             } else {
               // Packet was Acknowledged, but there is more to transmit
               _wait_after_start_bit_us = BIT_TIME;      // wait enough time to stabilize
@@ -664,8 +668,6 @@ void CEC_Device::runTransmit() {
           // BROADCAST message
           if (electrical_line_state == 0) {
             // No ACK
-            _ring_buffer.push(_transmit_buffer, _transmit_buffer_bytes, CEC_RingBuffer::MSG_TRANSMITTED, false);
-            // OnTransmitComplete(_transmit_buffer, _transmitBufferBitIdx >> 3, false);
             _state = CEC_IDLE;
           } else {
             // message was acked
@@ -673,8 +675,7 @@ void CEC_Device::runTransmit() {
               // Nothing left to transmit, go back to idle
               _transmit_buffer_bytes = 0;
               _state = CEC_IDLE;
-              _ring_buffer.push(_transmit_buffer, _transmitBufferBitIdx >> 3, CEC_RingBuffer::MSG_TRANSMITTED, true);
-              // OnTransmitComplete(_transmit_buffer, _transmitBufferBitIdx >> 3, true);
+              transmit_ack = true;
             } else {
               // Packet was Acknowledged, but there is more to transmit
               _wait_after_start_bit_us = BIT_TIME;      // wait enough time to stabilize
@@ -705,8 +706,12 @@ void CEC_Device::runTransmit() {
         break;
     }
   }
-  _line_state_expected = electrical_line_state;
-  _transmit_buffer_bytes = 0;     // TODO stop for now
+  // Do not retry here: Rx ISR is disabled while a Tx is pending, so arbitration
+  // loss cannot yet hand over to the winning frame and track its bus-free time.
+  setLineState(1, false);
+  _wait_after_start_bit_us = 0;
+  _ring_buffer.push(_transmit_buffer, transmit_bytes, CEC_RingBuffer::MSG_TRANSMITTED, transmit_ack);
+  _transmit_buffer_bytes = 0;
 }
 
 ///
@@ -988,6 +993,18 @@ void CEC_Device::run()
   checkMessages();
 }
 
+bool CEC_Device::waitForTransmit() {
+  _transmit_ack = false;
+  while (isTransmitting()) {
+    runTransmit();
+    if (isTransmitting()) { delay(1); }
+  }
+  // Deliver the completion callback before replying to the command. Processing
+  // Rx only now prevents a local reply from replacing this command's Tx result.
+  checkMessages();
+  return _transmit_ack;
+}
+
 bool CEC_Device::transmitRaw(const unsigned char* buffer, unsigned int count)
 {
   if (_monitor_mode)
@@ -1062,9 +1079,12 @@ void CEC_Device::enableISR(void) {
 \*********************************************************************************************/
 
 uint16_t CEC_Device::discoverPhysicalAddress() {
-	uint16_t addr = HDMIGetPhysicalAddress();
-  // if not found, try the stored configuration
   uint16_t addr_from_settings = (Settings->hdmi_addr[1] << 8) | Settings->hdmi_addr[0];
+  if (Settings->hdmi_cec_device_type & HDMI_CEC_FORCE_PHYSICAL_ADDRESS) {
+    return addr_from_settings;    // including 0.0.0.0; never consult EDID
+  }
+  uint16_t addr = HDMIGetPhysicalAddress();
+  // if not found, try the stored configuration
   if (addr == 0x0000) {
     addr = addr_from_settings;
   }
@@ -1150,10 +1170,46 @@ void CEC_Device::OnReceiveComplete(uint8_t * buf, size_t len, bool ack)
       break;
     }
     case OP_GIVE_DEVICE_VENDOR_ID /*0x8C*/: // <Give Device Vendor ID>
+    {
       uint32_t vendor = getVendorId();
       uint8_t buf[4] = { OP_DEVICE_VENDOR_ID /*0x87*/, (uint8_t)vendor, (uint8_t)(vendor >> 8), (uint8_t)(vendor >> 16)};
       transmitFrame(0xf, buf, 4); // <Device Vendor ID>
       break;
+    }
+    case OP_GIVE_DEVICE_POWER_STATUS /*0x8F*/:
+    {
+      if (_type != CDT_TV) { break; }
+      uint8_t reply[] = { OP_REPORT_POWER_STATUS, 0x00 }; // always on
+      transmitFrame(from, reply, sizeof(reply));
+      break;
+    }
+    case OP_GET_CEC_VERSION /*0x9F*/:
+    {
+      if (_type != CDT_TV) { break; }
+      uint8_t reply[] = { OP_CEC_VERSION, 0x05 }; // CEC 1.4
+      transmitFrame(from, reply, sizeof(reply));
+      break;
+    }
+    case OP_GIVE_OSD_SCREEN /*0x46*/: // <Give OSD Name>
+    {
+      if (_type != CDT_TV) { break; }
+      uint8_t reply[15] = { OP_SET_OSD_NAME };
+      const char *name = SettingsText(SET_DEVICENAME);
+      size_t count = 1;
+      while (*name && count < sizeof(reply)) {
+        uint8_t c = *name++;
+        reply[count++] = (c >= 0x20 && c <= 0x7E) ? c : '?';
+      }
+      transmitFrame(from, reply, count);
+      break;
+    }
+    case OP_GET_MENU_LANGUAGE /*0x91*/:
+    {
+      if (_type != CDT_TV) { break; }
+      uint8_t reply[] = { OP_SET_MENU_LANGUAGE, 'e', 'n', 'g' };
+      transmitFrame(0x0F, reply, sizeof(reply)); // <Set Menu Language> is broadcast
+      break;
+    }
   }
 }
 
@@ -1161,6 +1217,8 @@ void CEC_Device::OnTransmitComplete(uint8_t* buf, size_t len, bool ack)
 {
 	// This is called after a frame is transmitted.
   AddLog(LOG_LEVEL_DEBUG, "CEC: Packet sent: %*_H %s", len, buf, ack ? PSTR("ACK") : PSTR("NAK"));
+  _transmit_ack = ack;
+  if (_on_tx_cb) { _on_tx_cb(this, buf, len, ack); }
 
   if (len == 1 && _logical_address < 0) {
     // we are still in the logical address discovery phase

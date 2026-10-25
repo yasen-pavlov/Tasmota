@@ -1,6 +1,13 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## [16.0.0-htcec] Local HDMI-CEC bridge changes
+- Publish received frames addressed to the audio system (logical address 5), in addition to our address and broadcasts. Define `HDMI_CEC_PUBLISH_AUDIO_SYSTEM=0` to disable the extra destination.
+- `HdmiAddr 0x0000` (or another 16-bit address) stores and forces the physical address without EDID, using bit 7 of the existing device-type setting; the Settings layout is unchanged. Decimal input remains supported. `HdmiAddr -1` clears forcing and restores EDID / stored-address / 0x1000 fallback. Both changes require `Restart 1`; `HdmiAddr`, including the setter response, reports the currently running address. `HdmiType` preserves the force flag and reports only the device type.
+- TV devices answer directed Give Device Power Status with On (`90 00`), Get CEC Version with CEC 1.4 (`9E 05`), Give OSD Name with up to 14 bytes of DeviceName (non-printable/non-ASCII bytes become `?`), and Get Menu Language with broadcast `32 65 6E 67` (English). Requests still reach MQTT/rules.
+- `HdmiSend` (JSON and hex) and `HdmiSendRaw` wait for completion and respond with `{"HdmiSend":{"Ack":true}}` / `{"HdmiSendRaw":{"Ack":false}}` instead of `Done`. Ack is false for NAK, arbitration/line errors, or a busy bus; broadcast success means no follower signalled an error, not proof of a recipient.
+- Retransmission remains disabled, including for header-only polling: the current pending-Tx gate disables receive interrupts and cannot safely follow an arbitration winner or establish its bus-free interval.
+
 ## [Released]
 
 ## [16.0.0] 20261016
