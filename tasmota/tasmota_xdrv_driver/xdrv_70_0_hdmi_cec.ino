@@ -63,6 +63,7 @@ public:
     MSG_EMPTY = 0,
     MSG_RECEIVED,
     MSG_TRANSMITTED,
+    MSG_TRANSMIT_ABORTED,  // no valid ACK/NAK sample (busy bus or line error)
     MSG_LOG,              // debug log
   } CEC_MSG_TYPE;
 
@@ -290,7 +291,7 @@ protected:
   void runTransmit();
   void IRAM_ATTR runReceiveISR();
   void OnReceiveComplete(uint8_t* buffer, size_t count, bool ack);
-  void OnTransmitComplete(uint8_t* buffer, size_t count, bool ack);
+  void OnTransmitComplete(uint8_t* buffer, size_t count, bool ack, bool completed);
   void OnReady(int getLogicalAddress);
 
 private:
@@ -512,6 +513,7 @@ void CEC_Device::runTransmit() {
   bool electrical_line_state = lineState();
   const uint32_t transmit_bytes = _transmit_buffer_bytes;
   bool transmit_ack = false;
+  bool transmit_complete = false;
 
   _state = CEC_XMIT_WAIT;     // start with XMIT_WAIT
   _bit_start_time = now;
@@ -643,6 +645,7 @@ void CEC_Device::runTransmit() {
 
           if (electrical_line_state == 1) {
             // No ACK
+            transmit_complete = true;
 
             // Normally we retransmit.  But this is NOT the case for <Polling Message> as its
             // function is basically to 'ping' a logical address in which case we just want
@@ -658,6 +661,7 @@ void CEC_Device::runTransmit() {
               _transmit_buffer_bytes = 0;
               _state = CEC_IDLE;
               transmit_ack = true;
+              transmit_complete = true;
             } else {
               // Packet was Acknowledged, but there is more to transmit
               _wait_after_start_bit_us = BIT_TIME;      // wait enough time to stabilize
@@ -668,6 +672,7 @@ void CEC_Device::runTransmit() {
           // BROADCAST message
           if (electrical_line_state == 0) {
             // No ACK
+            transmit_complete = true;
             _state = CEC_IDLE;
           } else {
             // message was acked
@@ -676,6 +681,7 @@ void CEC_Device::runTransmit() {
               _transmit_buffer_bytes = 0;
               _state = CEC_IDLE;
               transmit_ack = true;
+              transmit_complete = true;
             } else {
               // Packet was Acknowledged, but there is more to transmit
               _wait_after_start_bit_us = BIT_TIME;      // wait enough time to stabilize
@@ -710,7 +716,8 @@ void CEC_Device::runTransmit() {
   // loss cannot yet hand over to the winning frame and track its bus-free time.
   setLineState(1, false);
   _wait_after_start_bit_us = 0;
-  _ring_buffer.push(_transmit_buffer, transmit_bytes, CEC_RingBuffer::MSG_TRANSMITTED, transmit_ack);
+  _ring_buffer.push(_transmit_buffer, transmit_bytes,
+                    transmit_complete ? CEC_RingBuffer::MSG_TRANSMITTED : CEC_RingBuffer::MSG_TRANSMIT_ABORTED, transmit_ack);
   _transmit_buffer_bytes = 0;
 }
 
@@ -1048,19 +1055,21 @@ bool CEC_Device::transmitFrame(int targetAddress, const unsigned char* buffer, i
 
 void CEC_Device::checkMessages() {
   for (int32_t idx = _ring_buffer.pullMsgIdx(); idx >= 0; idx = _ring_buffer.pullMsgIdx()) {
-    CEC_RingBuffer::CEC_msg_t *msg = &_ring_buffer._msg[idx];
-    if (msg->type == CEC_RingBuffer::MSG_RECEIVED) {
-      OnReceiveComplete(msg->buf, msg->len, msg->ack);
-    } else if (msg->type == CEC_RingBuffer::MSG_TRANSMITTED) {
-      OnTransmitComplete(msg->buf, msg->len, msg->ack);
+    CEC_RingBuffer::CEC_msg_t msg = _ring_buffer._msg[idx];
+    // Release the slot before callbacks: rules/Berry can synchronously send
+    // another frame and re-enter checkMessages().
+    _ring_buffer.ackMsg(idx);
+    if (msg.type == CEC_RingBuffer::MSG_RECEIVED) {
+      OnReceiveComplete(msg.buf, msg.len, msg.ack);
+    } else if (msg.type == CEC_RingBuffer::MSG_TRANSMITTED || msg.type == CEC_RingBuffer::MSG_TRANSMIT_ABORTED) {
+      OnTransmitComplete(msg.buf, msg.len, msg.ack, msg.type == CEC_RingBuffer::MSG_TRANSMITTED);
     }
 #ifdef HDMI_DEBUG
-    else if (msg->type == CEC_RingBuffer::MSG_LOG) {
+    else if (msg.type == CEC_RingBuffer::MSG_LOG) {
       AddLog(LOG_LEVEL_DEBUG, PSTR("CEC: log (%i - %i) actual=%i code=0x%04X line=%i state=%i"),
-            msg->timing_expected_low, msg->timing_expected_high, msg->timing, msg->code, msg->line, msg->state);
+            msg.timing_expected_low, msg.timing_expected_high, msg.timing, msg.code, msg.line, msg.state);
     }
 #endif
-    _ring_buffer.ackMsg(idx);       // remove message from ring buffer
   }
 }
 
@@ -1155,8 +1164,9 @@ void CEC_Device::OnReceiveComplete(uint8_t * buf, size_t len, bool ack)
   int32_t to = buf[0] & 0x0F;
   if (_on_rx_cb) { _on_rx_cb(this, from, to, buf+1, len-1, ack); }
 
-	// Ignore messages not sent to us
-	if (to != getLogicalAddress()) { return; }
+  // Ignore messages not sent to us or sent by an unregistered initiator.
+  // Never turn a directed response into a broadcast to logical address 15.
+  if (to != getLogicalAddress() || from == 0x0F) { return; }
 
 	// No command received?
 	if (len < 2) { return; }
@@ -1196,6 +1206,10 @@ void CEC_Device::OnReceiveComplete(uint8_t * buf, size_t len, bool ack)
       uint8_t reply[15] = { OP_SET_OSD_NAME };
       const char *name = SettingsText(SET_DEVICENAME);
       size_t count = 1;
+      if (!*name) {
+        memcpy_P(reply + count, PSTR("Tasmota"), 7);
+        count += 7;
+      }
       while (*name && count < sizeof(reply)) {
         uint8_t c = *name++;
         reply[count++] = (c >= 0x20 && c <= 0x7E) ? c : '?';
@@ -1213,10 +1227,14 @@ void CEC_Device::OnReceiveComplete(uint8_t * buf, size_t len, bool ack)
   }
 }
 
-void CEC_Device::OnTransmitComplete(uint8_t* buf, size_t len, bool ack)
+void CEC_Device::OnTransmitComplete(uint8_t* buf, size_t len, bool ack, bool completed)
 {
-	// This is called after a frame is transmitted.
-  AddLog(LOG_LEVEL_DEBUG, "CEC: Packet sent: %*_H %s", len, buf, ack ? PSTR("ACK") : PSTR("NAK"));
+  if (len == 1 && _logical_address < 0 && !completed) {
+    // No ACK/NAK was sampled; do not mistake arbitration loss for a free LA.
+    // Reschedule this discovery poll, without advancing the candidate address.
+    transmit(*_valid_logical_addr, *_valid_logical_addr, NULL, 0);
+    return;
+  }
   _transmit_ack = ack;
   if (_on_tx_cb) { _on_tx_cb(this, buf, len, ack); }
 

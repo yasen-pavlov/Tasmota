@@ -307,21 +307,33 @@ uint16_t HDMIGetPhysicalAddress(void) {
 
 // HdmiAddr 0x0000 stores and forces the physical address, including TV root 0.
 // Decimal input remains supported. HdmiAddr -1 returns to EDID discovery.
-// Changes take effect after Restart 1; a query reports the running address.
+// Changes take effect after Restart 1; report both running and stored state.
 void CmndHDMIAddr(void) {
   if (XdrvMailbox.data_len > 0) {
     if (XdrvMailbox.payload == -1) {
       Settings->hdmi_cec_device_type &= ~HDMI_CEC_FORCE_PHYSICAL_ADDRESS;
       SettingsSaveAll();
-    } else if (XdrvMailbox.payload >= 0 && XdrvMailbox.payload <= 0xFFFF) {
+    } else if (XdrvMailbox.payload >= 0 && XdrvMailbox.payload < 0xFFFF) {
       uint16_t hdmi_addr = XdrvMailbox.payload;
-      Settings->hdmi_addr[0] = hdmi_addr & 0xFF;
-      Settings->hdmi_addr[1] = (hdmi_addr >> 8) & 0xFF;
-      Settings->hdmi_cec_device_type |= HDMI_CEC_FORCE_PHYSICAL_ADDRESS;
-      SettingsSaveAll();
+      bool zero_seen = false;
+      bool valid = true;
+      for (int32_t shift = 12; shift >= 0; shift -= 4) {
+        uint8_t port = (hdmi_addr >> shift) & 0x0F;
+        if (zero_seen && port) { valid = false; break; }
+        if (!port) { zero_seen = true; }
+      }
+      if (valid) {
+        Settings->hdmi_addr[0] = hdmi_addr & 0xFF;
+        Settings->hdmi_addr[1] = (hdmi_addr >> 8) & 0xFF;
+        Settings->hdmi_cec_device_type |= HDMI_CEC_FORCE_PHYSICAL_ADDRESS;
+        SettingsSaveAll();
+      }
     }
   }
-  Response_P(PSTR("{\"%s\":\"0x%04X\"}"), XdrvMailbox.command, HDMI_CEC_device->getPhysicalAddress());
+  uint16_t stored = (Settings->hdmi_addr[1] << 8) | Settings->hdmi_addr[0];
+  Response_P(PSTR("{\"%s\":\"0x%04X\",\"Stored\":\"0x%04X\",\"Forced\":%s}"),
+             XdrvMailbox.command, HDMI_CEC_device->getPhysicalAddress(), stored,
+             (Settings->hdmi_cec_device_type & HDMI_CEC_FORCE_PHYSICAL_ADDRESS) ? PSTR("true") : PSTR("false"));
 }
 
 /*********************************************************************************************\
