@@ -472,6 +472,13 @@ CEC_Device::CEC_Device(int gpio, CEC_DEVICE_TYPE type, bool promiscuous, bool mo
 }
 
 void CEC_Device::start(void) {
+#ifdef ESP32
+  // Open-drain output with the input buffer enabled: setLineState() then only toggles the
+  // output level. Reconfiguring the pad with pinMode() per bit (ESP8266 style) goes through
+  // gpio_config(), which on ESP32 drops the edge interrupt of our own line release, so the
+  // receive ISR missed its post-ACK rising edge and every directed frame timed out.
+  pinMode(_gpio, OUTPUT_OPEN_DRAIN | PULLUP);
+#endif
   setLineState(1);    // default state is HIGH
   enableISR();        // start interrupt handler
 
@@ -1117,6 +1124,11 @@ bool IRAM_ATTR CEC_Device::lineState()
 
 bool IRAM_ATTR CEC_Device::setLineState(bool state, bool check)
 {
+#ifdef ESP32
+  // Pad stays OUTPUT_OPEN_DRAIN | PULLUP (see start()): HIGH releases the line, LOW drives it.
+  digitalWrite(_gpio, state ? HIGH : LOW);
+  delayMicroseconds(state ? CEC_MAX_RISE_TIME : CEC_MAX_FALL_TIME);
+#else
   // Using the following states, we can connect directly the GPIO to CEC pin without any transistor:
   //   - for high, configure as input + pullup, there is also a pull-up in the TV
   //   - for low, configure as output and drive low
@@ -1128,6 +1140,7 @@ bool IRAM_ATTR CEC_Device::setLineState(bool state, bool check)
 		pinMode(_gpio, OUTPUT);
     delayMicroseconds(CEC_MAX_FALL_TIME);     // wait for the line to fall
 	}
+#endif
   _line_state_expected = state;
   if (check) {
     bool electrical_line_state = lineState();
